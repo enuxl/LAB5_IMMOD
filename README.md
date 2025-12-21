@@ -130,7 +130,7 @@ $\hat{\beta} = (X^TX)^{-1}X^Ty$
 ### Выходные данные
 Результаты автоматически сохраняются в файл:
 
-**[analysis_results_v8.txt](./analysis_results_v8.txt)**
+**[analysis_results_v8.txt](./results.txt)**
 
 Содержание отчета:
 - Коэффициенты модели с p-значениями
