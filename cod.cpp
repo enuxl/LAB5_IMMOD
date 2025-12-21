@@ -8,976 +8,765 @@
 #include <cmath>
 #include <iomanip>
 #include <limits>
+#include <exception>
 #include <Eigen/Dense>
 
 using namespace std;
-using namespace Eigen;
+using Eigen::MatrixXd;
+using Eigen::VectorXd;
 
-// ============================================================================
-// КОНФИГУРАЦИЯ ПРОГРАММЫ
-// ============================================================================
+// ========================================================
+// ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ВЫВОДА
+// ========================================================
 
-#define DEFAULT_DATA_FILENAME "DataV8.csv"  // Файл по умолчанию
-#define SIGNIFICANCE_LEVEL 0.05            // Уровень значимости по умолчанию
-#define CORRELATION_THRESHOLD 0.8          // Порог мультиколлинеарности
-#define MIN_FACTORS 5                      // Минимальное число факторов
-#define MIN_OBSERVATIONS 5                 // Минимальное число наблюдений
+void showCorrelationTable(const MatrixXd& corr_mat,
+    const vector<string>& var_names) {
+    cout << "\nТаблица корреляций между независимыми переменными:\n";
+    cout << setw(18) << " ";
+    for (const auto& name : var_names)
+        cout << setw(14) << name.substr(0, 12);
+    cout << "\n";
 
-// ============================================================================
-// КЛАСС ДЛЯ РАБОТЫ С ДАННЫМИ РОССТАТА
-// ============================================================================
+    for (int row = 0; row < corr_mat.rows(); row++) {
+        cout << setw(18) << var_names[row].substr(0, 12);
+        for (int col = 0; col < corr_mat.cols(); col++) {
+            cout << setw(14) << fixed << setprecision(4) << corr_mat(row, col);
+        }
+        cout << "\n";
+    }
+}
 
-class RosstatData {
+void showDependentCorrelations(const VectorXd& corr_vec,
+    const vector<string>& var_names) {
+    cout << "\nКорреляции независимых переменных с зависимой:\n";
+    for (int i = 0; i < corr_vec.size(); i++) {
+        cout << setw(22) << left << var_names[i]
+            << ": " << fixed << setprecision(4) << corr_vec[i] << "\n";
+    }
+}
+
+// ========================================================
+// КЛАСС ДЛЯ ЗАГРУЗКИ И ОБРАБОТКИ ДАННЫХ
+// ========================================================
+
+class TimeSeriesData {
 private:
-    struct TimeSeries {
-        string region_name;
-        string region_code;
-        vector<double> values;
+    struct RegionData {
+        string area_name;
+        string area_code;
+        vector<double> yearly_values;
     };
 
-    vector<TimeSeries> series_data;
-    vector<string> time_periods;
-    vector<string> factor_names;
-    vector<int> selected_years;  // Годы, используемые как факторы
-    int target_year_idx;         // Индекс целевого года (отклика)
+    vector<RegionData> all_regions;
+    vector<string> year_list;
+    vector<string> independent_names;
+    vector<int> chosen_years;
+    int current_year_idx;
 
 public:
-    RosstatData() : target_year_idx(-1) {}
+    TimeSeriesData() : current_year_idx(-1) {}
 
-    // Чтение данных из CSV файла Росстата
-    bool loadFromCSV(const string& filename) {
-        ifstream file(filename);
-        if (!file.is_open()) {
-            cerr << "Ошибка: не удалось открыть файл " << filename << endl;
+    bool openDataFile(const string& file_path) {
+        ifstream data_file(file_path);
+        if (!data_file.is_open()) {
+            cerr << "Проблема: невозможно открыть файл " << file_path << endl;
             return false;
         }
 
-        string line;
-        int line_count = 0;
-        bool years_loaded = false;
+        string data_line;
+        int line_counter = 0;
 
-        while (getline(file, line)) {
-            line_count++;
+        while (getline(data_file, data_line)) {
+            line_counter++;
 
-            // Пропускаем пустые строки
-            if (line.empty() || line.find_first_not_of(';') == string::npos) {
+            if (data_line.empty() || data_line.find_first_not_of(';') == string::npos) {
                 continue;
             }
 
-            // Удаляем завершающие точки с запятой
-            while (!line.empty() && line.back() == ';') {
-                line.pop_back();
+            while (!data_line.empty() && data_line.back() == ';') {
+                data_line.pop_back();
             }
 
-            // Парсим строку с разделителем ';'
-            vector<string> tokens;
-            stringstream ss(line);
-            string token;
+            vector<string> elements;
+            stringstream ss(data_line);
+            string item;
 
-            while (getline(ss, token, ';')) {
-                tokens.push_back(token);
+            while (getline(ss, item, ';')) {
+                elements.push_back(item);
             }
 
-            if (tokens.size() < 3) continue;
+            if (elements.size() < 3) continue;
 
-            // Первые строки - заголовки
-            if (line_count == 1) {
-                // Первая строка - названия показателей (пропускаем)
+            if (line_counter == 1) {
                 continue;
             }
-            else if (line_count == 2) {
-                // Вторая строка - годы
-                for (size_t i = 2; i < tokens.size(); i++) {
-                    // Очищаем название года от " г."
-                    string year_str = tokens[i];
-                    size_t pos = year_str.find(" г.");
-                    if (pos != string::npos) {
-                        year_str = year_str.substr(0, pos);
+            else if (line_counter == 2) {
+                for (size_t idx = 2; idx < elements.size(); idx++) {
+                    string year_str = elements[idx];
+                    size_t dot_pos = year_str.find(" г.");
+                    if (dot_pos != string::npos) {
+                        year_str = year_str.substr(0, dot_pos);
                     }
-                    time_periods.push_back(year_str);
+                    year_list.push_back(year_str);
                 }
-                years_loaded = true;
             }
             else {
-                // Строки с данными
-                TimeSeries ts;
-                ts.region_name = tokens[0];
-                ts.region_code = tokens[1];
+                RegionData rd;
+                rd.area_name = elements[0];
+                rd.area_code = elements[1];
 
-                // Читаем значения
-                for (size_t i = 2; i < tokens.size(); i++) {
-                    string val_str = tokens[i];
+                for (size_t idx = 2; idx < elements.size(); idx++) {
+                    string val_str = elements[idx];
 
-                    // Очистка строки
                     val_str.erase(remove(val_str.begin(), val_str.end(), ' '), val_str.end());
                     val_str.erase(remove(val_str.begin(), val_str.end(), '\"'), val_str.end());
 
-                    // Замена запятой на точку для десятичных чисел
                     size_t comma_pos = val_str.find(',');
                     if (comma_pos != string::npos) {
                         val_str[comma_pos] = '.';
                     }
 
-                    // Удаление пробелов в качестве разделителей тысяч
-                    string cleaned;
-                    for (char c : val_str) {
-                        if (c != ' ') cleaned += c;
+                    string cleaned_value;
+                    for (char ch : val_str) {
+                        if (ch != ' ') cleaned_value += ch;
                     }
 
                     try {
-                        if (!cleaned.empty() && cleaned != "-" && cleaned != "…" &&
-                            cleaned != ".." && cleaned != "\"\"" && cleaned != ".") {
-                            ts.values.push_back(stod(cleaned));
+                        if (!cleaned_value.empty() && cleaned_value != "-" && cleaned_value != "…" &&
+                            cleaned_value != ".." && cleaned_value != "\"\"" && cleaned_value != ".") {
+                            rd.yearly_values.push_back(stod(cleaned_value));
                         }
                         else {
-                            ts.values.push_back(numeric_limits<double>::quiet_NaN());
+                            rd.yearly_values.push_back(numeric_limits<double>::quiet_NaN());
                         }
                     }
                     catch (...) {
-                        ts.values.push_back(numeric_limits<double>::quiet_NaN());
+                        rd.yearly_values.push_back(numeric_limits<double>::quiet_NaN());
                     }
                 }
 
-                // Добавляем ряд, если в нем достаточно данных
-                int valid_count = 0;
-                for (double val : ts.values) {
-                    if (!isnan(val)) valid_count++;
+                int non_nan_count = 0;
+                for (double v : rd.yearly_values) {
+                    if (!isnan(v)) non_nan_count++;
                 }
 
-                if (valid_count >= MIN_OBSERVATIONS) {
-                    series_data.push_back(ts);
+                if (non_nan_count >= 5) {
+                    all_regions.push_back(rd);
                 }
             }
         }
 
-        file.close();
+        data_file.close();
 
-        if (series_data.empty()) {
-            cerr << "Ошибка: не удалось загрузить данные из файла." << endl;
+        if (all_regions.empty()) {
+            cerr << "Проблема: данные из файла не загружены." << endl;
             return false;
         }
 
-        cout << "✓ Загружено временных рядов: " << series_data.size() << endl;
-        cout << "✓ Периодов данных: " << time_periods.size() << endl;
+        cout << "Загружено временных рядов: " << all_regions.size() << endl;
+        cout << "Временных отрезков: " << year_list.size() << endl;
 
-        if (!series_data.empty()) {
-            cout << "✓ Пример региона: " << series_data[0].region_name << endl;
-            cout << "✓ Количество наблюдений в ряду: " << series_data[0].values.size() << endl;
+        if (!all_regions.empty()) {
+            cout << "Пример региона: " << all_regions[0].area_name << endl;
         }
 
         return true;
     }
 
-    // Подготовка данных для регрессионного анализа
-    // Используем несколько предыдущих лет как факторы, последний год как отклик
-    bool prepareRegressionData(MatrixXd& X, VectorXd& y, int num_factors = MIN_FACTORS) {
-        vector<vector<double>> X_vec;
-        vector<double> y_vec;
+    bool prepareAnalysisData(MatrixXd& indep_vars, VectorXd& dep_var, int var_count = 5) {
+        vector<vector<double>> indep_rows;
+        vector<double> dep_values;
 
-        // Используем последний год как отклик
-        target_year_idx = time_periods.size() - 1;
+        current_year_idx = year_list.size() - 1;
 
-        // Используем предыдущие годы как факторы
-        for (int i = 0; i < num_factors; i++) {
-            selected_years.push_back(target_year_idx - i - 1);
-            factor_names.push_back("Year_" + time_periods[target_year_idx - i - 1]);
+        independent_names.clear();
+        chosen_years.clear();
+
+        for (int i = 0; i < var_count; i++) {
+            chosen_years.push_back(current_year_idx - i - 1);
+            independent_names.push_back("Yr_" + year_list[current_year_idx - i - 1]);
         }
 
-        // Для каждого региона собираем данные
-        for (const auto& ts : series_data) {
-            // Проверяем, есть ли данные за нужные годы
-            bool valid = true;
-            vector<double> x_row;
+        for (const auto& region : all_regions) {
+            bool valid_entry = true;
+            vector<double> row_data;
 
-            // Данные за факторные годы
-            for (int year_idx : selected_years) {
-                if (year_idx >= 0 && year_idx < (int)ts.values.size() &&
-                    !isnan(ts.values[year_idx])) {
-                    x_row.push_back(ts.values[year_idx]);
+            for (int year_idx : chosen_years) {
+                if (year_idx >= 0 && year_idx < (int)region.yearly_values.size() &&
+                    !isnan(region.yearly_values[year_idx])) {
+                    row_data.push_back(region.yearly_values[year_idx]);
                 }
                 else {
-                    valid = false;
+                    valid_entry = false;
                     break;
                 }
             }
 
-            // Данные за целевой год
-            if (valid && target_year_idx < (int)ts.values.size() &&
-                !isnan(ts.values[target_year_idx])) {
-                X_vec.push_back(x_row);
-                y_vec.push_back(ts.values[target_year_idx]);
+            if (valid_entry && current_year_idx < (int)region.yearly_values.size() &&
+                !isnan(region.yearly_values[current_year_idx])) {
+                indep_rows.push_back(row_data);
+                dep_values.push_back(region.yearly_values[current_year_idx]);
             }
         }
 
-        if (X_vec.size() < MIN_OBSERVATIONS) {
-            cerr << "Ошибка: недостаточно данных для анализа ("
-                << X_vec.size() << " наблюдений)" << endl;
+        if (indep_rows.size() < 5) {
+            cerr << "Проблема: данных для анализа недостаточно ("
+                << indep_rows.size() << " наблюдений)" << endl;
             return false;
         }
 
-        // Преобразуем в матрицы Eigen
-        int n = X_vec.size();
-        int m = num_factors;
+        int n_samples = indep_rows.size();
+        int n_vars = var_count;
 
-        X.resize(n, m);
-        y.resize(n);
+        indep_vars.resize(n_samples, n_vars);
+        dep_var.resize(n_samples);
 
-        for (int i = 0; i < n; i++) {
-            for (int j = 0; j < m; j++) {
-                X(i, j) = X_vec[i][j];
+        for (int i = 0; i < n_samples; i++) {
+            for (int j = 0; j < n_vars; j++) {
+                indep_vars(i, j) = indep_rows[i][j];
             }
-            y(i) = y_vec[i];
+            dep_var(i) = dep_values[i];
         }
 
-        cout << "\nПодготовка данных для регрессии:" << endl;
-        cout << "  Отклик (Y): данные за " << time_periods[target_year_idx] << " год" << endl;
-        cout << "  Факторы (X): " << m << " предыдущих лет" << endl;
-        cout << "  Наблюдений: " << n << endl;
-        cout << "  Факторов: " << m << endl;
+        cout << "\nПодготовка данных для анализа:" << endl;
+        cout << "  Зависимая переменная: данные " << year_list[current_year_idx] << " года" << endl;
+        cout << "  Независимые переменные: " << n_vars << " предыдущих лет" << endl;
+        cout << "  Количество наблюдений: " << n_samples << endl;
 
         return true;
     }
 
-    // Получить список регионов
-    vector<string> getRegionNames() const {
-        vector<string> names;
-        for (const auto& ts : series_data) {
-            names.push_back(ts.region_name);
-        }
-        return names;
+    vector<string> getIndependentNames() const {
+        return independent_names;
     }
 
-    // Получить данные региона по индексу
-    const TimeSeries& getRegionData(int idx) const {
-        return series_data[idx];
+    int getCurrentYearIndex() const {
+        return current_year_idx;
     }
 
-    // Получить названия факторов
-    vector<string> getFactorNames() const {
-        return factor_names;
-    }
-
-    // Получить индекс целевого года
-    int getTargetYearIdx() const {
-        return target_year_idx;
-    }
-
-    // Получить название целевого года
-    string getTargetYear() const {
-        if (target_year_idx >= 0 && target_year_idx < (int)time_periods.size()) {
-            return time_periods[target_year_idx];
+    string getCurrentYearLabel() const {
+        if (current_year_idx >= 0 && current_year_idx < (int)year_list.size()) {
+            return year_list[current_year_idx];
         }
         return "";
     }
 
-    // Количество регионов
-    int getRegionCount() const {
-        return series_data.size();
+    vector<string> getAreaNames() const {
+        vector<string> names;
+        for (const auto& region : all_regions) {
+            names.push_back(region.area_name);
+        }
+        return names;
+    }
+
+    const RegionData& getAreaInfo(int idx) const {
+        return all_regions[idx];
     }
 };
 
-// ============================================================================
-// КЛАСС МНОГОФАКТОРНОЙ ЛИНЕЙНОЙ РЕГРЕССИИ
-// ============================================================================
+// ========================================================
+// ФУНКЦИИ ДЛЯ РАСЧЕТА РАСПРЕДЕЛЕНИЙ
+// ========================================================
 
-class MultipleLinearRegression {
+double computeTCumulative(double t_val, int deg_free) {
+    double x_val = deg_free / (deg_free + t_val * t_val);
+    auto betaContFrac = [](double a_val, double b_val, double x_in) {
+        const int ITER_MAX = 100;
+        const double PRECISION = 3e-7;
+        double qab = a_val + b_val;
+        double qap = a_val + 1.0;
+        double qam = a_val - 1.0;
+        double c_val = 1.0;
+        double d_val = 1.0 - qab * x_in / qap;
+        if (fabs(d_val) < 1e-30) d_val = 1e-30;
+        d_val = 1.0 / d_val;
+        double h_val = d_val;
+        for (int iter = 1; iter <= ITER_MAX; ++iter) {
+            int m2 = 2 * iter;
+            double aa = iter * (b_val - iter) * x_in / ((qam + m2) * (a_val + m2));
+            d_val = 1.0 + aa * d_val;
+            if (fabs(d_val) < 1e-30) d_val = 1e-30;
+            c_val = 1.0 + aa / c_val;
+            if (fabs(c_val) < 1e-30) c_val = 1e-30;
+            d_val = 1.0 / d_val;
+            h_val *= d_val * c_val;
+            aa = -(a_val + iter) * (qab + iter) * x_in / ((a_val + m2) * (qap + m2));
+            d_val = 1.0 + aa * d_val;
+            if (fabs(d_val) < 1e-30) d_val = 1e-30;
+            c_val = 1.0 + aa / c_val;
+            if (fabs(c_val) < 1e-30) c_val = 1e-30;
+            d_val = 1.0 / d_val;
+            double delta_val = d_val * c_val;
+            h_val *= delta_val;
+            if (fabs(delta_val - 1.0) < PRECISION) break;
+        }
+        return h_val;
+    };
+
+    double a_val = deg_free / 2.0;
+    double b_val = 0.5;
+    double beta_term = exp(
+        lgamma(a_val + b_val) - lgamma(a_val) - lgamma(b_val)
+        + a_val * log(x_val) + b_val * log(1.0 - x_val)
+    );
+
+    if (t_val >= 0)
+        return 1.0 - 0.5 * beta_term * betaContFrac(a_val, b_val, x_val);
+    else
+        return 0.5 * beta_term * betaContFrac(a_val, b_val, x_val);
+}
+
+// ========================================================
+// КЛАСС ЛИНЕЙНОЙ РЕГРЕССИИ
+// ========================================================
+
+class LinearModel {
 private:
-    VectorXd beta;              // Коэффициенты модели
-    MatrixXd X_with_const;      // Матрица факторов с константой
-    MatrixXd X_original;        // Оригинальная матрица факторов
-    VectorXd y_original;        // Оригинальный вектор отклика
-    int n, k;                   // Количество наблюдений и параметров
-    vector<string> factor_names; // Названия факторов
+    MatrixXd original_X;
+    MatrixXd augmented_X;
+    VectorXd original_y;
+    VectorXd model_coeffs;
+    int sample_size;
+    int coeff_count;
+    vector<string> variable_labels;
 
 public:
-    MultipleLinearRegression() : n(0), k(0) {}
+    LinearModel() : sample_size(0), coeff_count(0) {}
 
-    // Обучение модели
-    bool fit(const MatrixXd& X, const VectorXd& y, const vector<string>& names) {
-        n = X.rows();
-        k = X.cols() + 1; // +1 для константы
-        factor_names = names;
-        X_original = X;
-        y_original = y;
+    bool buildModel(const MatrixXd& X_matrix, const VectorXd& y_vector,
+        const vector<string>& labels) {
+        if (X_matrix.rows() != y_vector.size()) return false;
+        sample_size = X_matrix.rows();
+        int var_count = X_matrix.cols();
+        coeff_count = var_count + 1;
+        original_X = X_matrix;
+        original_y = y_vector;
+        variable_labels = labels;
 
-        if (n <= k) {
-            cerr << "  Ошибка: недостаточно наблюдений (n=" << n
-                << ") для количества факторов (k=" << k << ")" << endl;
-            return false;
-        }
+        augmented_X.resize(sample_size, coeff_count);
+        augmented_X.col(0) = VectorXd::Ones(sample_size);
+        augmented_X.block(0, 1, sample_size, var_count) = X_matrix;
 
-        // Добавляем столбец единиц для константы
-        X_with_const.resize(n, k);
-        X_with_const.col(0).setOnes();
-        X_with_const.block(0, 1, n, k - 1) = X;
-
-        // Метод наименьших квадратов
-        beta = (X_with_const.transpose() * X_with_const)
-            .colPivHouseholderQr()
-            .solve(X_with_const.transpose() * y);
+        model_coeffs = (augmented_X.transpose() * augmented_X)
+            .inverse()
+            * augmented_X.transpose() * y_vector;
 
         return true;
     }
 
-    // Прогнозирование
-    VectorXd predict(const MatrixXd& X) const {
-        if (X.cols() != k - 1) {
-            cerr << "Ошибка: неверное количество факторов для прогноза" << endl;
-            return VectorXd();
-        }
-
-        int n_new = X.rows();
-        MatrixXd X_new_with_const(n_new, k);
-        X_new_with_const.col(0).setOnes();
-        X_new_with_const.block(0, 1, n_new, k - 1) = X;
-
-        return X_new_with_const * beta;
+    VectorXd makePredictions(const MatrixXd& X_matrix) const {
+        MatrixXd X_aug(X_matrix.rows(), coeff_count);
+        X_aug.col(0) = VectorXd::Ones(X_matrix.rows());
+        X_aug.block(0, 1, X_matrix.rows(), X_matrix.cols()) = X_matrix;
+        return X_aug * model_coeffs;
     }
 
-    // Получить коэффициенты
-    VectorXd getCoefficients() const {
-        return beta;
+    VectorXd getModelCoefficients() const {
+        return model_coeffs;
     }
 
-    // Рассчитать статистики модели
-    void calculateStatistics(double& r2, double& adj_r2, double& rmse,
-        double& mape, double& mae, VectorXd& std_errors,
-        VectorXd& t_stats, VectorXd& p_values) {
-        VectorXd y_pred = predict(X_original);
-        VectorXd residuals = y_original - y_pred;
+    vector<string> getVariableLabels() const {
+        return variable_labels;
+    }
 
-        // Суммы квадратов
-        double y_mean = y_original.mean();
-        double sst = (y_original.array() - y_mean).square().sum();
-        double sse = residuals.squaredNorm();
-        double ssr = sst - sse;
+    void evaluateModel(double& r_sq,
+        double& adj_r_sq,
+        double& root_mse,
+        double& mean_ape,
+        double& mean_ae,
+        VectorXd& std_errors,
+        VectorXd& t_values,
+        VectorXd& p_values) {
+        VectorXd predicted = makePredictions(original_X);
+        VectorXd residuals = original_y - predicted;
 
-        // R²
-        r2 = (sst > 0) ? (ssr / sst) : 0;
-
-        // Скорректированный R²
-        adj_r2 = 1 - (1 - r2) * (n - 1) / (n - k);
-
-        // RMSE
-        rmse = sqrt(sse / n);
-
-        // MAE
-        mae = residuals.array().abs().sum() / n;
-
-        // MAPE
-        mape = 0;
+        double ss_error = residuals.squaredNorm();
+        double ss_total = (original_y.array() - original_y.mean()).square().sum();
+        r_sq = 1.0 - ss_error / ss_total;
+        adj_r_sq = 1.0 - (1.0 - r_sq) * (sample_size - 1) / (sample_size - coeff_count);
+        root_mse = sqrt(ss_error / sample_size);
+        mean_ae = residuals.array().abs().mean();
+        mean_ape = 0.0;
         int valid_count = 0;
-        for (int i = 0; i < n; i++) {
-            if (y_original[i] != 0) {
-                mape += abs(residuals[i] / y_original[i]);
+
+        for (int i = 0; i < sample_size; i++) {
+            if (fabs(original_y[i]) > 1e-12) {
+                mean_ape += fabs(residuals[i] / original_y[i]);
                 valid_count++;
             }
         }
-        mape = (valid_count > 0) ? (mape / valid_count * 100) : 0;
+        if (valid_count > 0) mean_ape = mean_ape / valid_count * 100.0;
 
-        // Стандартные ошибки коэффициентов
-        MatrixXd XtX_inv = (X_with_const.transpose() * X_with_const).inverse();
-        double sigma2 = sse / (n - k);
-        std_errors = (sigma2 * XtX_inv.diagonal()).array().sqrt();
+        MatrixXd XtX_inverse = (augmented_X.transpose() * augmented_X).inverse();
+        double sigma_squared = ss_error / (sample_size - coeff_count);
+        std_errors = (sigma_squared * XtX_inverse.diagonal()).array().sqrt();
 
-        // t-статистики и p-значения
-        t_stats.resize(k);
-        p_values.resize(k);
+        t_values.resize(coeff_count);
+        p_values.resize(coeff_count);
+        int degrees_free = sample_size - coeff_count;
 
-        for (int i = 0; i < k; i++) {
-            t_stats[i] = beta[i] / std_errors[i];
-            // Двусторонний t-тест
-            double t_abs = abs(t_stats[i]);
-            // Аппроксимация p-value через распределение Стьюдента
-            p_values[i] = 2 * (1 - 0.5 * (1 + erf(t_abs / sqrt(2))));
+        for (int i = 0; i < coeff_count; i++) {
+            t_values[i] = model_coeffs[i] / std_errors[i];
+            double t_absolute = fabs(t_values[i]);
+            double cumul_prob = computeTCumulative(t_absolute, degrees_free);
+            p_values[i] = 2.0 * (1.0 - cumul_prob);
         }
     }
 
-    // F-статистика
-    double calculateFStatistic() {
-        VectorXd y_pred = predict(X_original);
-        VectorXd residuals = y_original - y_pred;
-
-        double sse = residuals.squaredNorm();
-        double ssr = (y_pred.array() - y_original.mean()).square().sum();
-
-        return (ssr / (k - 1)) / (sse / (n - k));
+    double computeFValue() {
+        VectorXd predicted = makePredictions(original_X);
+        VectorXd residuals = original_y - predicted;
+        double ss_error = residuals.squaredNorm();
+        double ss_regression = (predicted.array() - original_y.mean()).square().sum();
+        return (ss_regression / (coeff_count - 1)) / (ss_error / (sample_size - coeff_count));
     }
 
-    // Матрица корреляций между факторами
-    MatrixXd calculateCorrelationMatrix() {
-        int m = X_original.cols();
-        MatrixXd corr = MatrixXd::Zero(m, m);
+    MatrixXd computeVarCorrelations() {
+        int var_num = original_X.cols();
+        MatrixXd corr_matrix = MatrixXd::Zero(var_num, var_num);
 
-        for (int i = 0; i < m; i++) {
-            for (int j = i; j < m; j++) {
-                VectorXd col_i = X_original.col(i);
-                VectorXd col_j = X_original.col(j);
+        for (int i = 0; i < var_num; i++) {
+            for (int j = i; j < var_num; j++) {
+                VectorXd xi = original_X.col(i);
+                VectorXd xj = original_X.col(j);
+                double mean_i = xi.mean();
+                double mean_j = xj.mean();
+                double numerator = ((xi.array() - mean_i) * (xj.array() - mean_j)).sum();
+                double std_i = sqrt((xi.array() - mean_i).square().sum());
+                double std_j = sqrt((xj.array() - mean_j).square().sum());
 
-                double mean_i = col_i.mean();
-                double mean_j = col_j.mean();
-
-                double numerator = ((col_i.array() - mean_i) * (col_j.array() - mean_j)).sum();
-                double denom_i = sqrt((col_i.array() - mean_i).square().sum());
-                double denom_j = sqrt((col_j.array() - mean_j).square().sum());
-
-                if (denom_i > 0 && denom_j > 0) {
-                    corr(i, j) = numerator / (denom_i * denom_j);
-                    corr(j, i) = corr(i, j);
+                if (std_i > 0 && std_j > 0) {
+                    corr_matrix(i, j) = numerator / (std_i * std_j);
+                    corr_matrix(j, i) = corr_matrix(i, j);
                 }
             }
         }
-
-        return corr;
+        return corr_matrix;
     }
 
-    // Корреляции факторов с откликом
-    VectorXd calculateCorrelationWithResponse() {
-        int m = X_original.cols();
-        VectorXd corr_y(m);
+    VectorXd computeDepVarCorrelations() {
+        int var_num = original_X.cols();
+        VectorXd corr_vector(var_num);
+        double mean_y = original_y.mean();
+        double std_y = sqrt((original_y.array() - mean_y).square().sum());
 
-        for (int i = 0; i < m; i++) {
-            VectorXd col_i = X_original.col(i);
-            double mean_i = col_i.mean();
-            double mean_y = y_original.mean();
+        for (int i = 0; i < var_num; i++) {
+            VectorXd xi = original_X.col(i);
+            double mean_i = xi.mean();
+            double std_i = sqrt((xi.array() - mean_i).square().sum());
 
-            double numerator = ((col_i.array() - mean_i) * (y_original.array() - mean_y)).sum();
-            double denom_i = sqrt((col_i.array() - mean_i).square().sum());
-            double denom_y = sqrt((y_original.array() - mean_y).square().sum());
-
-            if (denom_i > 0 && denom_y > 0) {
-                corr_y[i] = numerator / (denom_i * denom_y);
+            if (std_i > 0 && std_y > 0) {
+                double numerator = ((xi.array() - mean_i) * (original_y.array() - mean_y)).sum();
+                corr_vector[i] = numerator / (std_i * std_y);
             }
             else {
-                corr_y[i] = 0;
+                corr_vector[i] = 0.0;
             }
         }
-
-        return corr_y;
+        return corr_vector;
     }
 
-    // Отбор значимых факторов по p-value
-    vector<int> selectSignificantFactors(const VectorXd& p_values, double alpha) {
-        vector<int> significant;
-        // Начинаем с 1, пропускаем константу
-        for (int i = 1; i < p_values.size(); i++) {
-            if (p_values[i] < alpha) {
-                significant.push_back(i - 1);
+    vector<int> findSignificantVars(const VectorXd& p_vals,
+        double alpha_level) {
+        vector<int> selected_vars;
+        for (int i = 1; i < p_vals.size(); i++) {
+            if (p_vals[i] < alpha_level) {
+                selected_vars.push_back(i - 1);
             }
         }
-        return significant;
+        return selected_vars;
     }
 
-    // Отбор факторов по мультиколлинеарности
-    vector<int> checkMulticollinearity(double threshold) {
-        MatrixXd corr_matrix = calculateCorrelationMatrix();
-        vector<int> to_remove;
+    vector<int> identifyCollinearVars(double corr_limit) {
+        MatrixXd corr_matrix = computeVarCorrelations();
+        VectorXd corr_with_y = computeDepVarCorrelations();
+        vector<int> vars_to_exclude;
 
         for (int i = 0; i < corr_matrix.rows(); i++) {
             for (int j = i + 1; j < corr_matrix.cols(); j++) {
-                if (abs(corr_matrix(i, j)) > threshold) {
-                    // Удаляем фактор с меньшей корреляцией с откликом
-                    VectorXd corr_y = calculateCorrelationWithResponse();
-                    if (abs(corr_y[i]) < abs(corr_y[j])) {
-                        if (find(to_remove.begin(), to_remove.end(), i) == to_remove.end()) {
-                            to_remove.push_back(i);
-                        }
+                if (fabs(corr_matrix(i, j)) > corr_limit) {
+                    if (fabs(corr_with_y[i]) < fabs(corr_with_y[j])) {
+                        if (find(vars_to_exclude.begin(), vars_to_exclude.end(), i) == vars_to_exclude.end())
+                            vars_to_exclude.push_back(i);
                     }
                     else {
-                        if (find(to_remove.begin(), to_remove.end(), j) == to_remove.end()) {
-                            to_remove.push_back(j);
-                        }
+                        if (find(vars_to_exclude.begin(), vars_to_exclude.end(), j) == vars_to_exclude.end())
+                            vars_to_exclude.push_back(j);
                     }
                 }
             }
         }
-
-        return to_remove;
+        return vars_to_exclude;
     }
 
-    // Создание новой модели с удаленными факторами
-    MultipleLinearRegression removeFactors(const vector<int>& indices_to_remove) {
-        if (indices_to_remove.empty()) return *this;
+    LinearModel createReducedModel(const vector<int>& indices) {
+        if (indices.empty()) return *this;
 
-        // Создаем новую матрицу факторов без удаленных столбцов
-        int new_cols = X_original.cols() - indices_to_remove.size();
-        MatrixXd X_new(n, new_cols);
+        int new_var_count = original_X.cols() - indices.size();
+        MatrixXd X_reduced(sample_size, new_var_count);
+        vector<string> new_labels;
+        int col_idx = 0;
 
-        vector<string> new_names;
-        int new_idx = 0;
-        for (int i = 0; i < X_original.cols(); i++) {
-            if (find(indices_to_remove.begin(), indices_to_remove.end(), i) == indices_to_remove.end()) {
-                X_new.col(new_idx) = X_original.col(i);
-                new_names.push_back(factor_names[i]);
-                new_idx++;
+        for (int i = 0; i < original_X.cols(); i++) {
+            if (find(indices.begin(), indices.end(), i) == indices.end()) {
+                X_reduced.col(col_idx) = original_X.col(i);
+                new_labels.push_back(variable_labels[i]);
+                col_idx++;
             }
         }
 
-        MultipleLinearRegression new_model;
-        new_model.fit(X_new, y_original, new_names);
-
-        return new_model;
-    }
-
-    // Получить названия факторов
-    vector<string> getFactorNames() const {
-        return factor_names;
+        LinearModel reduced_model;
+        reduced_model.buildModel(X_reduced, original_y, new_labels);
+        return reduced_model;
     }
 };
 
-// ============================================================================
-// ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-// ============================================================================
+// ============================================================
+// ФУНКЦИЯ ДЛЯ ЗАПИСИ РЕЗУЛЬТАТОВ
+// ============================================================
 
-// Вывод матрицы корреляций
-void printCorrelationMatrix(const MatrixXd& corr_matrix, const vector<string>& names) {
-    cout << "\nМатрица корреляций между факторами:\n";
-    cout << "     ";
-    for (const auto& name : names) {
-        cout << setw(10) << left << name.substr(0, 8) << " ";
-    }
-    cout << endl;
-
-    for (int i = 0; i < corr_matrix.rows(); i++) {
-        cout << setw(8) << left << names[i].substr(0, 8) << " ";
-        for (int j = 0; j < corr_matrix.cols(); j++) {
-            cout << setw(10) << fixed << setprecision(3) << corr_matrix(i, j) << " ";
-        }
-        cout << endl;
-    }
-}
-
-// Вывод корреляций с откликом
-void printCorrelationWithResponse(const VectorXd& corr_y, const vector<string>& names) {
-    cout << "\nКорреляции факторов с откликом:\n";
-    for (int i = 0; i < corr_y.size(); i++) {
-        cout << "  " << setw(15) << left << names[i] << ": "
-            << fixed << setprecision(4) << corr_y[i];
-        if (abs(corr_y[i]) > 0.7) cout << " (сильная)";
-        else if (abs(corr_y[i]) > 0.3) cout << " (умеренная)";
-        else cout << " (слабая)";
-        cout << endl;
-    }
-}
-
-// Интерактивный отбор факторов
-void interactiveFactorSelection(MultipleLinearRegression& model, double significance_level) {
-    cout << "\n=== ИНТЕРАКТИВНЫЙ ОТБОР ФАКТОРОВ ===\n";
-
-    // 1. Рассчитываем статистики
-    double r2, adj_r2, rmse, mape, mae;
-    VectorXd std_errors, t_stats, p_values;
-    model.calculateStatistics(r2, adj_r2, rmse, mape, mae, std_errors, t_stats, p_values);
-
-    // 2. Показываем текущие результаты
-    cout << "\nТекущая модель:\n";
-    cout << "  R²: " << fixed << setprecision(4) << r2 << endl;
-    cout << "  Скорректированный R²: " << adj_r2 << endl;
-    cout << "  Количество факторов: " << model.getFactorNames().size() << endl;
-
-    // 3. Показываем значимые факторы
-    vector<int> significant = model.selectSignificantFactors(p_values, significance_level);
-    cout << "\nЗначимые факторы (p < " << significance_level << "):\n";
-    if (significant.empty()) {
-        cout << "  Нет значимых факторов\n";
-    }
-    else {
-        for (int idx : significant) {
-            cout << "  ✓ " << model.getFactorNames()[idx]
-                << " (p = " << scientific << setprecision(2) << p_values[idx + 1] << ")\n";
-        }
-    }
-
-    // 4. Проверяем мультиколлинеарность
-    cout << "\nПроверка мультиколлинеарности (порог = " << CORRELATION_THRESHOLD << "):\n";
-    MatrixXd corr_matrix = model.calculateCorrelationMatrix();
-    vector<int> multicollinear = model.checkMulticollinearity(CORRELATION_THRESHOLD);
-
-    if (multicollinear.empty()) {
-        cout << "  Мультиколлинеарность не обнаружена\n";
-    }
-    else {
-        cout << "  Обнаружена мультиколлинеарность у факторов:\n";
-        for (int idx : multicollinear) {
-            cout << "  - " << model.getFactorNames()[idx] << endl;
-        }
-    }
-
-    // 5. Показываем корреляции с откликом
-    VectorXd corr_y = model.calculateCorrelationWithResponse();
-    printCorrelationWithResponse(corr_y, model.getFactorNames());
-}
-
-// Сохранение результатов в файл
-void saveResultsToFile(const string& filename,
+void writeAnalysisResults(const string& output_file,
     const VectorXd& coefficients,
-    const vector<string>& factor_names,
-    double r2, double adj_r2, double rmse,
-    double mape, double mae, double f_stat,
-    const VectorXd& p_values,
-    const vector<int>& significant_factors,
-    const MatrixXd& corr_matrix,
-    const VectorXd& corr_y) {
-    ofstream file(filename);
-    if (!file.is_open()) {
-        cerr << "Не удалось создать файл для сохранения результатов." << endl;
+    const vector<string>& labels,
+    double r2_val, double adj_r2_val,
+    double rmse_val, double mape_val, double mae_val,
+    double f_val,
+    const VectorXd& p_vals) {
+    ofstream out_stream(output_file);
+    if (!out_stream.is_open()) {
+        cerr << "Проблема с сохранением файла\n";
         return;
     }
 
-    file << fixed << setprecision(6);
-    file << "РЕЗУЛЬТАТЫ РЕГРЕССИОННОГО АНАЛИЗА\n";
-    file << "=================================\n\n";
+    out_stream << fixed << setprecision(6);
+    out_stream << "РЕЗУЛЬТАТЫ РЕГРЕССИОННОГО АНАЛИЗА\n";
+    out_stream << "=================================\n\n";
 
-    file << "Коэффициенты модели:\n";
-    file << "Константа: " << coefficients[0] << " (p-value: " << p_values[0] << ")\n";
-    for (size_t i = 0; i < factor_names.size(); i++) {
-        file << factor_names[i] << ": " << coefficients[i + 1]
-            << " (p-value: " << p_values[i + 1] << ")";
-        bool is_sig = false;
-        for (int idx : significant_factors) {
-            if (idx == (int)i) {
-                is_sig = true;
-                break;
-            }
-        }
-        if (is_sig) file << " *ЗНАЧИМ*";
-        file << "\n";
+    out_stream << "Коэффициенты модели:\n";
+    out_stream << "Константа: " << coefficients[0]
+        << " (p = " << p_vals[0] << ")\n";
+
+    for (size_t i = 0; i < labels.size(); i++) {
+        out_stream << labels[i] << ": "
+            << coefficients[i + 1]
+            << " (p = " << p_vals[i + 1] << ")\n";
     }
 
-    file << "\nКачество модели:\n";
-    file << "R²: " << r2 << "\n";
-    file << "R² скорректированный: " << adj_r2 << "\n";
-    file << "F-статистика: " << f_stat << "\n";
-    file << "RMSE: " << rmse << "\n";
-    file << "MAE: " << mae << "\n";
-    file << "MAPE: " << mape << "%\n";
+    out_stream << "\nКачество модели:\n";
+    out_stream << "R2: " << r2_val << "\n";
+    out_stream << "R2 adj: " << adj_r2_val << "\n";
+    out_stream << "F-stat: " << f_val << "\n";
+    out_stream << "RMSE: " << rmse_val << "\n";
+    out_stream << "MAE: " << mae_val << "\n";
+    out_stream << "MAPE: " << mape_val << "%\n";
 
-    file << "\nЗначимые факторы:\n";
-    if (significant_factors.empty()) {
-        file << "Нет значимых факторов\n";
-    }
-    else {
-        for (int idx : significant_factors) {
-            file << factor_names[idx] << " (p = " << p_values[idx + 1] << ")\n";
-        }
-    }
-
-    file << "\nКорреляции факторов с откликом:\n";
-    for (size_t i = 0; i < factor_names.size(); i++) {
-        file << factor_names[i] << ": " << corr_y[i] << "\n";
-    }
-
-    file << "\nМатрица корреляций между факторами:\n";
-    for (size_t i = 0; i < factor_names.size(); i++) {
-        file << setw(15) << left << factor_names[i];
-        for (size_t j = 0; j < factor_names.size(); j++) {
-            file << setw(10) << corr_matrix(i, j) << " ";
-        }
-        file << "\n";
-    }
-
-    file.close();
-    cout << "✓ Результаты сохранены в файл: " << filename << endl;
+    out_stream.close();
 }
 
-// Прогноз для новых данных
-void makePredictions(const RosstatData& data,
-    const MultipleLinearRegression& model,
-    const VectorXd& coefficients) {
-    cout << "\n=== ПРОГНОЗ ДЛЯ РЕГИОНОВ ===\n";
-
-    vector<string> regions = data.getRegionNames();
-    vector<pair<double, string>> predictions;
-
-    // Прогноз для каждого региона
-    for (int i = 0; i < min(20, (int)regions.size()); i++) {
-        auto region_data = data.getRegionData(i);
-        vector<string> factor_names = model.getFactorNames();
-        int num_factors = factor_names.size();
-
-        // Проверяем, есть ли данные за нужные годы
-        bool valid = true;
-        VectorXd x_row(num_factors);
-
-        // Предполагаем, что факторы - это последние num_factors лет перед целевым годом
-        int target_idx = data.getTargetYearIdx();
-
-        for (int j = 0; j < num_factors; j++) {
-            int year_idx = target_idx - num_factors + j;
-            if (year_idx >= 0 && year_idx < (int)region_data.values.size() &&
-                !isnan(region_data.values[year_idx])) {
-                x_row(j) = region_data.values[year_idx];
-            }
-            else {
-                valid = false;
-                break;
-            }
-        }
-
-        if (valid) {
-            // Прогноз
-            MatrixXd X_pred(1, num_factors);
-            X_pred.row(0) = x_row;
-            VectorXd y_pred = model.predict(X_pred);
-
-            if (y_pred.size() > 0) {
-                predictions.push_back({ y_pred(0), region_data.region_name });
-            }
-        }
-    }
-
-    // Сортировка по убыванию прогноза
-    sort(predictions.begin(), predictions.end(),
-        [](const pair<double, string>& a, const pair<double, string>& b) {
-            return a.first > b.first;
-        });
-
-    cout << "Топ-10 регионов по прогнозу:\n";
-    for (int i = 0; i < min(10, (int)predictions.size()); i++) {
-        cout << i + 1 << ". " << predictions[i].second
-            << ": " << fixed << setprecision(2) << predictions[i].first << endl;
-    }
-}
-
-// ============================================================================
-// ГЛАВНАЯ ФУНКЦИЯ
-// ============================================================================
+// ============================================================
+// ОСНОВНАЯ ПРОГРАММА
+// ============================================================
 
 int main() {
     setlocale(LC_ALL, "Russian");
 
-    cout << "================================================" << endl;
-    cout << "АНАЛИЗ ДАННЫХ РОССТАТА - МНОГОФАКТОРНАЯ РЕГРЕССИЯ" << endl;
-    cout << "================================================" << endl << endl;
+    cout << "=============================================\n";
+    cout << "АНАЛИЗ ЛИНЕЙНОЙ РЕГРЕССИИ\n";
+    cout << "=============================================\n\n";
 
     try {
-        // 1. ВЫБОР ФАЙЛА С ДАННЫМИ
-        cout << "Доступные файлы данных:\n";
-        cout << "DataV8.csv - Нефтяные скважины (2010-2021)\n";
+        // ВЫБОР ФАЙЛА
+        cout << "Укажите файл с данными (по умолчанию DataV8.csv): ";
+        string file_name;
+        getline(cin, file_name);
 
-        string filename;
-        cout << "\nВведите имя файла: ";
-        getline(cin, filename);
-
-        if (filename.empty()) {
-            filename = DEFAULT_DATA_FILENAME;
+        if (file_name.empty()) {
+            file_name = "DataV8.csv";
         }
 
-        // 2. ЗАГРУЗКА ДАННЫХ
-        cout << "\n1. ЗАГРУЗКА ДАННЫХ" << endl;
-        cout << "------------------" << endl;
+        // ЗАГРУЗКА ДАННЫХ
+        cout << "\n1. ЗАГРУЗКА ДАННЫХ\n";
+        cout << "------------------\n";
 
-        RosstatData data;
-        if (!data.loadFromCSV(filename)) {
-            cerr << "\nОшибка загрузки данных. Проверьте:\n";
-            cerr << "1. Наличие файла " << filename << endl;
-            cerr << "2. Формат файла (CSV с разделителем ';')\n";
-            cerr << "3. Структуру данных (регион, код, годы...)\n";
+        TimeSeriesData data_handler;
+        if (!data_handler.openDataFile(file_name)) {
+            cerr << "Ошибка загрузки данных.\n";
             return 1;
         }
 
-        // 3. ПОДГОТОВКА ДАННЫХ
-        cout << "\n2. ПОДГОТОВКА ДАННЫХ" << endl;
-        cout << "--------------------" << endl;
+        // ПОДГОТОВКА ДАННЫХ
+        cout << "\n2. ПОДГОТОВКА ДАННЫХ\n";
+        cout << "--------------------\n";
 
-        MatrixXd X;
-        VectorXd y;
+        MatrixXd X_matrix;
+        VectorXd y_vector;
 
-        int num_factors = MIN_FACTORS;
-        cout << "Введите количество факторов для анализа (по умолчанию "
-            << MIN_FACTORS << "): ";
-        string input;
-        getline(cin, input);
-        if (!input.empty()) {
+        int var_number = 5;
+        cout << "Введите число независимых переменных (по умолчанию 5): ";
+        string user_input;
+        getline(cin, user_input);
+
+        if (!user_input.empty()) {
             try {
-                num_factors = stoi(input);
-                if (num_factors < 2) num_factors = 2;
-                if (num_factors > 10) num_factors = 10;
+                var_number = stoi(user_input);
+                if (var_number < 2) var_number = 2;
+                if (var_number > 10) var_number = 10;
             }
             catch (...) {
-                num_factors = MIN_FACTORS;
+                var_number = 5;
             }
         }
 
-        if (!data.prepareRegressionData(X, y, num_factors)) {
-            cerr << "Ошибка подготовки данных для регрессии." << endl;
+        if (!data_handler.prepareAnalysisData(X_matrix, y_vector, var_number)) {
+            cerr << "Ошибка подготовки данных для анализа.\n";
             return 1;
         }
 
-        // 4. ВВОД ПАРАМЕТРОВ АНАЛИЗА
-        cout << "\n3. НАСТРОЙКА ПАРАМЕТРОВ" << endl;
-        cout << "----------------------" << endl;
+        // УСТАНОВКА ПАРАМЕТРОВ
+        cout << "\n3. УСТАНОВКА ПАРАМЕТРОВ\n";
+        cout << "----------------------\n";
 
-        double significance_level = SIGNIFICANCE_LEVEL;
-        cout << "Введите уровень значимости (по умолчанию "
-            << SIGNIFICANCE_LEVEL << "): ";
-        getline(cin, input);
-        if (!input.empty()) {
+        double sig_level = 0.05;
+        cout << "Укажите уровень значимости (по умолчанию 0.05): ";
+        getline(cin, user_input);
+
+        if (!user_input.empty()) {
             try {
-                significance_level = stod(input);
-                if (significance_level <= 0) significance_level = SIGNIFICANCE_LEVEL;
-                if (significance_level >= 1) significance_level = SIGNIFICANCE_LEVEL;
+                sig_level = stod(user_input);
+                if (sig_level <= 0) sig_level = 0.05;
+                if (sig_level >= 1) sig_level = 0.05;
             }
             catch (...) {
-                significance_level = SIGNIFICANCE_LEVEL;
+                sig_level = 0.05;
             }
         }
 
-        // 5. ОБУЧЕНИЕ МОДЕЛИ
-        cout << "\n4. ОБУЧЕНИЕ МОДЕЛИ" << endl;
-        cout << "------------------" << endl;
+        double colin_threshold = 0.8;
+        cout << "Укажите порог мультиколлинеарности (по умолчанию 0.8): ";
+        getline(cin, user_input);
 
-        vector<string> factor_names = data.getFactorNames();
-        MultipleLinearRegression model;
-        if (!model.fit(X, y, factor_names)) {
-            cerr << "Не удалось обучить модель." << endl;
+        if (!user_input.empty()) {
+            try {
+                colin_threshold = stod(user_input);
+                if (colin_threshold <= 0) colin_threshold = 0.8;
+                if (colin_threshold >= 1) colin_threshold = 0.8;
+            }
+            catch (...) {
+                colin_threshold = 0.8;
+            }
+        }
+
+        // ПОСТРОЕНИЕ МОДЕЛИ
+        cout << "\n4. ПОСТРОЕНИЕ МОДЕЛИ\n";
+        cout << "-------------------\n";
+
+        vector<string> var_labels = data_handler.getIndependentNames();
+        LinearModel regression_model;
+
+        if (!regression_model.buildModel(X_matrix, y_vector, var_labels)) {
+            cerr << "Модель не может быть построена.\n";
             return 1;
         }
-        cout << "✓ Модель успешно обучена" << endl;
 
-        // 6. ИНТЕРАКТИВНЫЙ ОТБОР ФАКТОРОВ
-        char choice;
-        do {
-            interactiveFactorSelection(model, significance_level);
+        cout << "Модель успешно построена\n";
 
-            cout << "\nХотите удалить незначимые факторы? (y/n): ";
-            getline(cin, input);
-            if (!input.empty()) choice = tolower(input[0]);
-
-            if (choice == 'y') {
-                // Рассчитываем статистики для текущей модели
-                double r2, adj_r2, rmse, mape, mae;
-                VectorXd std_errors, t_stats, p_values;
-                model.calculateStatistics(r2, adj_r2, rmse, mape, mae, std_errors, t_stats, p_values);
-
-                // Находим незначимые факторы
-                vector<int> insignificant;
-                for (int i = 1; i < p_values.size(); i++) {
-                    if (p_values[i] >= significance_level) {
-                        insignificant.push_back(i - 1);
-                    }
-                }
-
-                if (!insignificant.empty()) {
-                    cout << "\nУдаление незначимых факторов:\n";
-                    for (int idx : insignificant) {
-                        cout << "  - " << model.getFactorNames()[idx] << endl;
-                    }
-
-                    // Создаем новую модель без незначимых факторов
-                    MultipleLinearRegression new_model = model.removeFactors(insignificant);
-
-                    if (new_model.getFactorNames().size() > 0) {
-                        model = new_model;
-                        cout << "\nНовая модель создана с "
-                            << model.getFactorNames().size() << " факторами.\n";
-                    }
-                }
-                else {
-                    cout << "\nВсе факторы значимы.\n";
-                    break;
-                }
-            }
-            else {
-                break;
-            }
-
-            cout << "\nПродолжить отбор факторов? (y/n): ";
-            getline(cin, input);
-            if (!input.empty()) choice = tolower(input[0]);
-
-        } while (choice == 'y');
-
-        // 7. ФИНАЛЬНЫЙ АНАЛИЗ
-        cout << "\n5. ФИНАЛЬНЫЙ АНАЛИЗ МОДЕЛИ" << endl;
-        cout << "--------------------------" << endl;
-
+        // ВЫЧИСЛЕНИЕ СТАТИСТИК
         double r2, adj_r2, rmse, mape, mae;
-        VectorXd std_errors, t_stats, p_values;
-        model.calculateStatistics(r2, adj_r2, rmse, mape, mae, std_errors, t_stats, p_values);
-        double f_stat = model.calculateFStatistic();
+        VectorXd se, t_stats, p_vals;
+        regression_model.evaluateModel(r2, adj_r2, rmse, mape, mae, se, t_stats, p_vals);
+        double f_value = regression_model.computeFValue();
 
-        VectorXd coefficients = model.getCoefficients();
-        vector<string> final_factor_names = model.getFactorNames();
-        vector<int> significant_factors = model.selectSignificantFactors(p_values, significance_level);
-        MatrixXd corr_matrix = model.calculateCorrelationMatrix();
-        VectorXd corr_y = model.calculateCorrelationWithResponse();
+        // ВЫВОД РЕЗУЛЬТАТОВ
+        cout << "\n5. РЕЗУЛЬТАТЫ АНАЛИЗА\n";
+        cout << "--------------------\n";
 
-        // Вывод результатов
-        cout << fixed << setprecision(4);
         cout << "\nКоэффициенты модели:\n";
-        cout << "Константа: " << coefficients[0]
-            << " (p-value: " << scientific << setprecision(2) << p_values[0] << ")\n";
+        VectorXd coeffs = regression_model.getModelCoefficients();
+        cout << "Константа: " << coeffs[0]
+            << " (p=" << p_vals[0] << ")\n";
 
-        for (size_t i = 0; i < final_factor_names.size(); i++) {
-            cout << final_factor_names[i] << ": " << fixed << setprecision(4) << coefficients[i + 1]
-                << " (p-value: " << scientific << setprecision(2) << p_values[i + 1] << ")";
+        for (size_t i = 0; i < var_labels.size(); i++) {
+            cout << var_labels[i] << ": "
+                << coeffs[i + 1]
+                << " (p=" << p_vals[i + 1] << ")\n";
+        }
 
-            bool is_sig = false;
-            for (int idx : significant_factors) {
-                if (idx == (int)i) {
-                    is_sig = true;
-                    break;
+        cout << "\nR2 = " << r2
+            << "\nСкорр. R2 = " << adj_r2
+            << "\nF-статистика = " << f_value
+            << "\nСКО = " << rmse
+            << "\nСр.абс.ошибка = " << mae
+            << "\nСр.отн.ошибка = " << mape << "%\n";
+
+        // ПРОВЕРКА КОЛЛИНЕАРНОСТИ
+        cout << "\n6. ПРОВЕРКА КОЛЛИНЕАРНОСТИ\n";
+        cout << "--------------------------\n";
+
+        MatrixXd corr_matrix = regression_model.computeVarCorrelations();
+        showCorrelationTable(corr_matrix, var_labels);
+
+        VectorXd corr_with_y = regression_model.computeDepVarCorrelations();
+        showDependentCorrelations(corr_with_y, var_labels);
+
+        vector<int> collinear_vars = regression_model.identifyCollinearVars(colin_threshold);
+        if (!collinear_vars.empty()) {
+            cout << "\nОбнаружена коллинеарность у переменных:\n";
+            for (int idx : collinear_vars) {
+                cout << "  - " << var_labels[idx] << endl;
+            }
+
+            cout << "\nИсключить проблемные переменные? (y/n): ";
+            getline(cin, user_input);
+
+            if (!user_input.empty() && tolower(user_input[0]) == 'y') {
+                LinearModel updated_model = regression_model.createReducedModel(collinear_vars);
+                regression_model = updated_model;
+                var_labels = regression_model.getVariableLabels();
+
+                regression_model.evaluateModel(r2, adj_r2, rmse, mape, mae, se, t_stats, p_vals);
+                f_value = regression_model.computeFValue();
+                coeffs = regression_model.getModelCoefficients();
+
+                cout << "\nМодель обновлена. Новые коэффициенты:\n";
+                cout << "Константа: " << coeffs[0] << " (p=" << p_vals[0] << ")\n";
+                for (size_t i = 0; i < var_labels.size(); i++) {
+                    cout << var_labels[i] << ": " << coeffs[i + 1] << " (p=" << p_vals[i + 1] << ")\n";
                 }
             }
-            if (is_sig) cout << " *ЗНАЧИМ*";
-            cout << endl;
         }
 
-        cout << "\nКачество модели:\n";
-        cout << "R²: " << r2 << endl;
-        cout << "R² скорректированный: " << adj_r2 << endl;
-        cout << "F-статистика: " << f_stat << endl;
-        cout << "RMSE: " << rmse << endl;
-        cout << "MAE: " << mae << endl;
-        cout << "MAPE: " << mape << "%" << endl;
+        // ОТБОР ЗНАЧИМЫХ ПЕРЕМЕННЫХ
+        cout << "\n7. ОТБОР ЗНАЧИМЫХ ПЕРЕМЕННЫХ\n";
+        cout << "---------------------------\n";
 
-        cout << "\nОценка адекватности модели:\n";
-        if (f_stat > 10 && r2 > 0.7) {
-            cout << "  ✓ ОТЛИЧНАЯ (F > 10, R² > 0.7)\n";
-        }
-        else if (f_stat > 5 && r2 > 0.5) {
-            cout << "  ✓ ХОРОШАЯ (F > 5, R² > 0.5)\n";
-        }
-        else if (f_stat > 2 && r2 > 0.3) {
-            cout << "  ✓ УДОВЛЕТВОРИТЕЛЬНАЯ (F > 2, R² > 0.3)\n";
+        vector<int> significant_vars = regression_model.findSignificantVars(p_vals, sig_level);
+        if (!significant_vars.empty()) {
+            cout << "Значимые переменные (p < " << sig_level << "):\n";
+            for (int idx : significant_vars) {
+                cout << "  ok " << var_labels[idx]
+                    << " (p = " << scientific << setprecision(2) << p_vals[idx + 1] << ")\n";
+            }
         }
         else {
-            cout << "  ✗ НИЗКАЯ (требует доработки)\n";
+            cout << "Значимых переменных на уровне " << sig_level << " не обнаружено\n";
         }
 
-        // 8. ПРОГНОЗИРОВАНИЕ
-        cout << "\n6. ПРОГНОЗИРОВАНИЕ" << endl;
-        cout << "-----------------" << endl;
+        // ЗАПИСЬ РЕЗУЛЬТАТОВ
+        cout << "\n8. ЗАПИСЬ РЕЗУЛЬТАТОВ\n";
+        cout << "-------------------\n";
 
-        makePredictions(data, model, coefficients);
+        writeAnalysisResults("analysis_results_v8.txt",
+            coeffs, var_labels,
+            r2, adj_r2,
+            rmse, mape, mae,
+            f_value, p_vals);
 
-        // 9. СОХРАНЕНИЕ РЕЗУЛЬТАТОВ
-        cout << "\n7. СОХРАНЕНИЕ РЕЗУЛЬТАТОВ" << endl;
-        cout << "-----------------------" << endl;
-
-        saveResultsToFile("regression_results.txt",
-            coefficients, final_factor_names,
-            r2, adj_r2, rmse, mape, mae, f_stat,
-            p_values, significant_factors,
-            corr_matrix, corr_y);
-
-        cout << "\n================================================" << endl;
-        cout << "АНАЛИЗ ЗАВЕРШЕН УСПЕШНО!" << endl;
-        cout << "================================================" << endl;
-
-        cout << "\nКраткие результаты:\n";
-        cout << "------------------\n";
-        cout << "1. Использовано факторов: " << final_factor_names.size() << endl;
-        cout << "2. Значимых факторов: " << significant_factors.size() << endl;
-        cout << "3. Качество модели (R²): " << r2 * 100 << "%" << endl;
-        cout << "4. Точность прогноза (MAPE): " << mape << "%" << endl;
-        cout << "5. Результаты сохранены в файл: regression_results.txt\n";
+        cout << "Анализ успешно завершен\n";
+        cout << "Результаты сохранены в: analysis_results_v8.txt\n";
 
     }
     catch (const exception& e) {
-        cerr << "\n!!! КРИТИЧЕСКАЯ ОШИБКА !!!" << endl;
-        cerr << e.what() << endl;
+        cerr << "Ошибка выполнения: " << e.what() << "\n";
         return 1;
     }
 
